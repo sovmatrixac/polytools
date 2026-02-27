@@ -11,7 +11,7 @@ into a list of dictionaries with friendly field names.
 The dictionaries are intended to be convenient for both human inspection
 and downstream programmatic use (for example, claim automation).
 
-The output structure is a "整理好的字典列表" (cleaned-up list of dicts).
+The output structure is a cleaned-up list of dicts.
 Each item contains at least the following keys:
 
     - market_question
@@ -346,10 +346,10 @@ if __name__ == "__main__":  # 简单 CLI 示例
     try:
         positions = get_all_positions(address)
     except InvalidAddressError as exc:
-        print(f"地址校验失败: {exc}")
+        print(f"Invalid address : {exc}")
         sys.exit(1)
     except PolymarketAPIError as exc:
-        print(f"查询持仓失败: {exc}")
+        print(f"API error: {exc}")
         sys.exit(1)
 
     print(_format_positions_for_cli(positions))
