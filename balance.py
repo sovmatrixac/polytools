@@ -265,8 +265,8 @@ def main() -> int:
     print("--------------------------------")
     print(f"资金地址 (funder): {result_with_funder['funder']}")
     print(f"资产类型 (asset_type): {result_with_funder['asset_type']}")
-    print(f"余额 (balance): {result_with_funder['balance']}")
-    print(f"授权额度 (allowance): {result_with_funder['allowance']}")
+    print(f"余额 in dollar(balance): {str(float(result_with_funder['balance'])/1000000.0)}")
+    #print(f"授权额度 (allowance): {result_with_funder['allowance']}")
 
     return 0
 
