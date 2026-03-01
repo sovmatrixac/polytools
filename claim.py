@@ -61,6 +61,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from polymarket_apis.types.clob_types import ApiCreds
 
 from dotenv import load_dotenv
 
@@ -218,10 +219,19 @@ def _claim_via_gasless_builder(
     except ValueError:
         chain_id = POLYGON_CHAIN_ID
 
+    builder_creds = ApiCreds(
+        key=os.getenv("POLY_BUILDER_API_KEY"),
+        secret=os.getenv("POLY_BUILDER_SECRET"),
+        passphrase=os.getenv("POLY_BUILDER_PASSPHRASE")
+    )
+
+    print(builder_creds)
+ 
     client = PolymarketGaslessWeb3Client(
         private_key=pk,
         signature_type=signature_type,
         chain_id=chain_id,
+        builder_creds=builder_creds,
     )
 
     success: List[Dict[str, Any]] = []
@@ -492,6 +502,7 @@ def claim_all_winnings(
         )
     except RuntimeError as exc:
         gasless_error = str(exc)
+        print(f"Gasless/builder 路径不可用，原因: {gasless_error}")
 
     all_success.extend(gasless_success)
     all_failed.extend(gasless_failed)
