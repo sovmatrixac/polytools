@@ -1,27 +1,39 @@
-"""CLI helper for querying a wallet's USDC ERC20 balance on EVM networks.
+"""使用 Polymarket CLOB Python 客户端（Builder 模式）查询当前账户的 USDC 抵押余额和授权额度。
 
-The script is primarily geared towards Polymarket's main network (Polygon),
-using the canonical USDC.e collateral token. Optionally, it can also query
-USDC on Base and Arbitrum.
+本脚本通过 L2 方法 ``get_balance_allowance`` 查询 CLOB 视角下的余额与 allowance，
+默认资产类型为 ``COLLATERAL``（USDC 抵押品），链为 Polygon (chain_id=137)。
 
-在未显式提供 RPC URL 且未设置对应环境变量时，脚本会为所选网络依次尝试一小组
-内置的公共 RPC 端点，选取第一个可连通的节点作为数据来源。
+运行前置条件
+------------
 
-Usage examples
---------------
+1. 安装依赖（示例）::
 
-    # 使用 .env 中的 FUNDER_ADDRESS / USER_ADDRESS，默认 Polygon
+    pip install python-dotenv py_clob_client py_builder_signing_sdk
+
+2. 在仓库根目录下配置 `.env` 文件或直接设置环境变量：
+
+    - ``PRIVATE_KEY``: 用于签名的 EOA 私钥（十六进制字符串，建议带 0x 前缀）
+    - ``FUNDER_ADDRESS``: Polymarket 代理钱包/资金地址（即在网站上看到的 Profile 地址）
+    - ``POLY_BUILDER_API_KEY``: Builder API Key
+    - ``POLY_BUILDER_SECRET``: Builder API Secret
+    - ``POLY_BUILDER_PASSPHRASE``: Builder API Passphrase
+
+   如无特殊需要，链与 CLOB Host 使用默认配置：
+
+    - host: ``https://clob.polymarket.com``
+    - chain_id: ``137`` (Polygon 主网)
+
+用法示例
+--------
+
+无参数时，查询 COLLATERAL 余额与授权并以人类可读方式输出::
+
     python balanece.py
 
-    # 指定地址，默认 Polygon
-    python balanece.py 0xYourWallet
+以 JSON 格式输出（便于脚本继续处理）::
 
-    # 指定网络与 RPC
-    python balanece.py 0xYourWallet --network polygon
-    python balanece.py 0xYourWallet --network base --rpc-url https://base-mainnet.example
+    python balanece.py --json
 
-The module can also be imported and the :func:`get_usdc_balance` function
-reused from other Python code.
 """
 
 from __future__ import annotations
@@ -30,396 +42,235 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
 
-from positions import InvalidAddressError, _normalize_address, is_valid_evm_address  # type: ignore[attr-defined]
+# BalanceAllowanceParams / AssetType 在较新版本的 py_clob_client 中提供。
+# 为了兼容旧版本，这里使用 try/except 在运行时优雅降级为 dict 调用。
+try:  # pragma: no cover - 导入是否存在取决于安装的版本
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001 - 兼容 ImportError / AttributeError 等
+    BalanceAllowanceParams = None  # type: ignore[assignment]
+    AssetType = None  # type: ignore[assignment]
 
 
-class RPCConfigError(RuntimeError):
-    """Raised when RPC URL is missing or unreachable."""
+# 默认 CLOB Host 与链 ID，可通过环境变量覆盖。
+DEFAULT_HOST = "https://clob.polymarket.com"
+DEFAULT_CHAIN_ID = 137  # Polygon Mainnet
 
 
 @dataclass
-class NetworkConfig:
-    """Configuration for a single EVM network."""
+class ClientConfig:
+    """用于初始化 CLOB 客户端的配置。"""
 
-    name: str
+    host: str
     chain_id: int
-    usdc_address: str
-    rpc_env_var: str
+    private_key: str
+    funder_address: str
+    builder_api_key: str
+    builder_secret: str
+    builder_passphrase: str
 
 
-# Canonical USDC.e on Polygon used by Polymarket as collateral.
-POLYGON_USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+def _load_client_config() -> ClientConfig:
+    """从环境变量加载并校验 CLOB / Builder 相关配置。
 
-# Canonical USDC on Base and Arbitrum. These are public contract addresses.
-BASE_USDC_ADDRESS = "0x833589fCD6eDaC0C2142dE3916c1c1D6cBfA27F6"
-ARBITRUM_USDC_ADDRESS = "0xaf88d065e77c8C2239327C5EDb3A432268e5831"
-
-DEFAULT_NETWORK = "polygon"
-
-NETWORKS: Dict[str, NetworkConfig] = {
-    "polygon": NetworkConfig(
-        name="polygon",
-        chain_id=137,
-        usdc_address=POLYGON_USDC_E_ADDRESS,
-        rpc_env_var="POLYGON_RPC_URL",
-    ),
-    "base": NetworkConfig(
-        name="base",
-        chain_id=8453,
-        usdc_address=BASE_USDC_ADDRESS,
-        rpc_env_var="BASE_RPC_URL",
-    ),
-    "arbitrum": NetworkConfig(
-        name="arbitrum",
-        chain_id=42161,
-        usdc_address=ARBITRUM_USDC_ADDRESS,
-        rpc_env_var="ARBITRUM_RPC_URL",
-    ),
-}
-
-
-PUBLIC_RPC_ENDPOINTS: Dict[str, Sequence[str]] = {
-    # A small, conservative list of public mainnet endpoints for each network.
-    "polygon": (
-        "https://polygon-rpc.com",
-        "https://polygon.llamarpc.com",
-        "https://rpc.ankr.com/polygon",
-        "https://1rpc.io/polygon",
-    ),
-    "base": (
-        "https://mainnet.base.org",
-        "https://base.llamarpc.com",
-        "https://rpc.ankr.com/base",
-    ),
-    "arbitrum": (
-        "https://arb1.arbitrum.io/rpc",
-        "https://arbitrum.llamarpc.com",
-        "https://rpc.ankr.com/arbitrum",
-    ),
-}
-
-
-def _get_network_config(name: Optional[str]) -> NetworkConfig:
-    """Return :class:`NetworkConfig` for the given network name.
-
-    Network names are matched case-insensitively. If ``name`` is empty or
-    ``None``, :data:`DEFAULT_NETWORK` is used.
+    若关键环境变量缺失或为空，抛出 ValueError 以便上层捕获并打印友好错误信息。
     """
 
-    normalized = (name or DEFAULT_NETWORK).strip().lower()
-    if not normalized:
-        normalized = DEFAULT_NETWORK
+    host = os.getenv("POLY_CLOB_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
 
-    cfg = NETWORKS.get(normalized)
-    if cfg is None:
-        supported = ", ".join(sorted(NETWORKS.keys()))
-        raise ValueError(f"不支持的网络: {name!r}。当前支持: {supported}")
-    return cfg
-
-
-def _get_public_rpc_candidates(cfg: NetworkConfig) -> Sequence[str]:
-    """Return a small list of built-in public RPC URLs for ``cfg``'s network.
-
-    These are used as a safe fallback when neither an explicit ``--rpc-url``
-    nor the corresponding environment variable is provided. Especially useful
-    in builder 模式等无法预先配置环境变量的运行环境。
-    """
-
-    return PUBLIC_RPC_ENDPOINTS.get(cfg.name, ())
-
-
-def _resolve_rpc_url(cfg: NetworkConfig, explicit_rpc_url: Optional[str]) -> Optional[str]:
-    """Resolve the RPC URL from CLI argument or environment.
-
-    Priority:
-
-    1. ``explicit_rpc_url`` if provided and non-empty
-    2. Environment variable specified by ``cfg.rpc_env_var``
-
-    If both sources are absent, returns ``None`` so that the caller can fall
-    back to built-in public RPC endpoints.
-    """
-
-    if explicit_rpc_url:
-        url = explicit_rpc_url.strip()
-        if url:
-            return url
-
-    env_url = os.getenv(cfg.rpc_env_var, "").strip()
-    if env_url:
-        return env_url
-
-    # No explicit or env RPC URL configured; let caller decide how to fall back.
-    return None
-
-
-def get_usdc_balance(
-    address: str,
-    network: str = DEFAULT_NETWORK,
-    rpc_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Query on-chain USDC balance for ``address`` on the given network.
-
-    Parameters
-    ----------
-    address:
-        EVM wallet address. Both ``0x``-prefixed and plain hex strings are
-        accepted; the function normalizes and validates them using
-        :func:`positions.is_valid_evm_address`.
-    network:
-        Logical network name. Defaults to ``"polygon"``. Supported values
-        currently are ``"polygon"``, ``"base"`` and ``"arbitrum"``.
-    rpc_url:
-        Optional RPC URL. When omitted, the function first checks the
-        environment variable associated with the selected network (for
-        example ``POLYGON_RPC_URL``). If that is also missing, it falls back
-        to a small built-in list of public RPC endpoints and uses the first
-        one that is reachable.
-
-    Returns
-    -------
-    dict
-        A dictionary with the following keys:
-
-        - ``address``: normalized wallet address
-        - ``network``: logical network name
-        - ``chain_id``: numeric chain ID
-        - ``usdc_contract``: USDC ERC20 contract address
-        - ``symbol``: token symbol (best effort, defaults to "USDC")
-        - ``decimals``: token decimals (best effort, defaults to 6)
-        - ``raw_balance``: integer ERC20 balance
-        - ``balance``: human-readable float balance
-    """
-
-    # Normalize and validate address using the shared helper from positions.py
-    normalized = _normalize_address(address)
-    if not is_valid_evm_address(normalized):
-        raise InvalidAddressError(f"钱包地址格式无效: {address!r}")
-
-    cfg = _get_network_config(network)
-    resolved_rpc_url = _resolve_rpc_url(cfg, rpc_url)
-
+    chain_id_raw = (
+        os.getenv("POLY_CHAIN_ID")
+        or os.getenv("CHAIN_ID")
+        or str(DEFAULT_CHAIN_ID)
+    )
     try:
-        from web3 import Web3  # type: ignore
-    except ImportError as exc:  # pragma: no cover - 环境相关
-        raise RuntimeError(
-            "web3 未安装，无法查询链上余额。请先安装 web3，例如: pip install web3"
+        chain_id = int(chain_id_raw)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - 防御性
+        raise ValueError(
+            f"CHAIN_ID/POLY_CHAIN_ID 配置非法（当前值: {chain_id_raw!r}），"
+            "请设置为整数，例如 137。"
         ) from exc
 
-    w3 = None
+    private_key = (os.getenv("PRIVATE_KEY") or "").strip()
+    funder_address = (os.getenv("FUNDER_ADDRESS") or "").strip()
+    builder_api_key = (os.getenv("POLY_BUILDER_API_KEY") or "").strip()
+    builder_secret = (os.getenv("POLY_BUILDER_SECRET") or "").strip()
+    builder_passphrase = (os.getenv("POLY_BUILDER_PASSPHRASE") or "").strip()
 
-    # 1) 显式或环境变量提供的 RPC URL
-    if resolved_rpc_url:
-        w3 = Web3(Web3.HTTPProvider(resolved_rpc_url))
-        if not w3.is_connected():  # pragma: no cover - 网络相关
-            raise RPCConfigError(
-                f"无法连接到 {cfg.name} RPC 节点，请检查 {cfg.rpc_env_var} 或 --rpc-url 配置。"
-            )
+    missing = []
+    if not private_key:
+        missing.append("PRIVATE_KEY")
+    if not funder_address:
+        missing.append("FUNDER_ADDRESS")
+    if not builder_api_key:
+        missing.append("POLY_BUILDER_API_KEY")
+    if not builder_secret:
+        missing.append("POLY_BUILDER_SECRET")
+    if not builder_passphrase:
+        missing.append("POLY_BUILDER_PASSPHRASE")
 
-    # 2) 无任何显式/环境配置时，尝试内置的公共 RPC 列表
-    if w3 is None:
-        candidates = list(_get_public_rpc_candidates(cfg))
-        if not candidates:
-            raise RPCConfigError(
-                f"未配置 {cfg.name} RPC URL，且当前脚本未内置公共 RPC 列表。"
-                f"请通过环境变量 {cfg.rpc_env_var} 或命令行参数 --rpc-url 提供。"
-            )
+    if missing:
+        raise ValueError(
+            "缺少必需的环境变量: "
+            + ", ".join(missing)
+            + "。请在 .env 或系统环境中设置后重试。"
+        )
 
-        last_error: Optional[Exception] = None
-        for url in candidates:
-            candidate_w3 = Web3(Web3.HTTPProvider(url))
-            try:
-                if candidate_w3.is_connected():  # pragma: no cover - 网络相关
-                    w3 = candidate_w3
-                    resolved_rpc_url = url
-                    break
-            except Exception as exc:  # pragma: no cover - 网络相关
-                last_error = exc
+    return ClientConfig(
+        host=host,
+        chain_id=chain_id,
+        private_key=private_key,
+        funder_address=funder_address,
+        builder_api_key=builder_api_key,
+        builder_secret=builder_secret,
+        builder_passphrase=builder_passphrase,
+    )
 
-        if w3 is None:
-            urls = ", ".join(candidates)
-            extra = f" 最后一次连接错误: {last_error}" if last_error else ""
-            raise RPCConfigError(
-                f"无法连接到任何 {cfg.name} 公共 RPC 节点。尝试的 URL: {urls}。"  # noqa: E501
-                f"请检查本地网络，或通过环境变量 {cfg.rpc_env_var} 或 --rpc-url 指定可用的 RPC。"  # noqa: E501
-                + extra
-            )
 
-    # Minimal ERC20 ABI: balanceOf, decimals, symbol
-    erc20_abi = [
-        {
-            "name": "decimals",
-            "type": "function",
-            "stateMutability": "view",
-            "inputs": [],
-            "outputs": [{"name": "", "type": "uint8"}],
-        },
-        {
-            "name": "symbol",
-            "type": "function",
-            "stateMutability": "view",
-            "inputs": [],
-            "outputs": [{"name": "", "type": "string"}],
-        },
-        {
-            "name": "balanceOf",
-            "type": "function",
-            "stateMutability": "view",
-            "inputs": [{"name": "owner", "type": "address"}],
-            "outputs": [{"name": "", "type": "uint256"}],
-        },
-    ]
+def _init_clob_client(cfg: ClientConfig) -> ClobClient:
+    """按照 Builder 模式初始化 CLOB 客户端并返回。
 
-    contract = w3.eth.contract(address=cfg.usdc_address, abi=erc20_abi)
+    步骤：
+    1. 使用 EOA 私钥与链 ID 创建临时客户端，派生/获取用户 L2 API 凭证；
+    2. 基于 Builder API Key/Secret/Passphrase 构造 :class:`BuilderConfig`；
+    3. 携带 L2 凭证 + BuilderConfig 初始化最终的 :class:`ClobClient`，
+       设置 ``signature_type=1``（Email/Magic / Proxy 钱包）与 ``funder`` 地址。
+    """
 
-    try:
-        decimals_value = contract.functions.decimals().call()
-    except Exception:  # pragma: no cover - 链上行为
-        decimals_value = 6
+    # 1. 用户 L1 -> L2 凭证派生
+    temp_client = ClobClient(cfg.host, key=cfg.private_key, chain_id=cfg.chain_id)
+    user_api_creds = temp_client.create_or_derive_api_creds()
 
-    try:
-        symbol_value = contract.functions.symbol().call()
-    except Exception:  # pragma: no cover - 链上行为
-        symbol_value = "USDC"
+    # 2. Builder API 凭证配置
+    builder_creds = BuilderApiKeyCreds(
+        key=cfg.builder_api_key,
+        secret=cfg.builder_secret,
+        passphrase=cfg.builder_passphrase,
+    )
+    builder_config = BuilderConfig(local_builder_creds=builder_creds)
 
-    try:
-        raw_balance_value = contract.functions.balanceOf(normalized).call()
-    except Exception as exc:  # pragma: no cover - 链上行为
-        raise RuntimeError(f"调用 balanceOf 失败: {exc}") from exc
+    # 3. 最终带 Builder 的 CLOB 客户端
+    client = ClobClient(
+        cfg.host,
+        key=cfg.private_key,
+        chain_id=cfg.chain_id,
+        creds=user_api_creds,
+        signature_type=1,  # 邮箱登录 / Magic Link 用户通常为 1
+        funder=cfg.funder_address,
+        builder_config=builder_config,
+    )
 
-    try:
-        decimals = int(decimals_value)
-    except Exception:
-        decimals = 6
+    return client
 
-    if decimals < 0:
-        decimals = 6
 
-    try:
-        raw_balance = int(raw_balance_value)
-    except Exception:
-        # Fallback, though Web3 should already return int-like values.
-        raw_balance = 0
+def _query_collateral_balance_allowance(client: ClobClient) -> Dict[str, Any]:
+    """查询 COLLATERAL（USDC 抵押品）的余额与授权额度。
 
-    human_balance = raw_balance / (10 ** decimals) if decimals > 0 else float(raw_balance)
+    返回包含 balance / allowance 的原始响应 dict 或 dict 化结果。
+    """
+
+    # 优先使用 py_clob_client 提供的类型；若当前版本不存在则回退为字典参数。
+    if BalanceAllowanceParams is not None and AssetType is not None:  # type: ignore[truthy-function]
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)  # type: ignore[call-arg]
+    else:
+        params = {"asset_type": "COLLATERAL"}
+
+    # get_balance_allowance 为 L2 方法，需要已配置 creds/funder。
+    resp: Any = client.get_balance_allowance(params)  # type: ignore[arg-type]
+
+    # 兼容两种返回形式：dict 或具备属性的对象。
+    if isinstance(resp, dict):
+        balance = resp.get("balance")
+        allowance = resp.get("allowance")
+    else:
+        balance = getattr(resp, "balance", None)
+        allowance = getattr(resp, "allowance", None)
 
     return {
-        "address": normalized,
-        "network": cfg.name,
-        "chain_id": cfg.chain_id,
-        "usdc_contract": cfg.usdc_address,
-        "symbol": str(symbol_value),
-        "decimals": decimals,
-        "raw_balance": raw_balance,
-        "balance": float(human_balance),
+        "asset_type": "COLLATERAL",
+        "balance": "" if balance is None else str(balance),
+        "allowance": "" if allowance is None else str(allowance),
     }
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entry point for querying USDC balances.
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数。
 
-    Examples
-    --------
+    当前仅暴露一个 ``--json`` 选项用于控制输出格式：
 
-        python balanece.py 0xYourWallet
-        python balanece.py 0xYourWallet --network polygon
-        python balanece.py --network polygon  # 使用 .env 中的默认地址
+    - 默认：人类可读文本输出；
+    - ``--json``: 输出单行 JSON，字段包含 ``asset_type`` / ``balance`` /
+      ``allowance`` / ``funder``。
     """
-
-    load_dotenv()
 
     parser = argparse.ArgumentParser(
         description=(
-            "查询指定地址在指定网络上的 USDC ERC20 余额（默认 Polygon / USDC.e）。"
-            "在未显式提供 --rpc-url 且未设置对应环境变量时，会自动尝试一小组公共 RPC 节点。"
+            "查询当前 Polymarket 账户在 Polygon 上的 USDC 抵押余额与授权额度 "
+            "（CLOB L2 / Builder 模式）。"
         )
-    )
-    parser.add_argument(
-        "address",
-        nargs="?",
-        help=(
-            "要查询的 EVM 钱包地址。若省略，则尝试从环境变量 FUNDER_ADDRESS / USER_ADDRESS 中读取。"
-        ),
-    )
-    parser.add_argument(
-        "-n",
-        "--network",
-        dest="network",
-        default=os.getenv("USDC_NETWORK", DEFAULT_NETWORK),
-        choices=sorted(NETWORKS.keys()),
-        help=(
-            "查询使用的网络，默认 %(default)s。可选值: "
-            + ", ".join(sorted(NETWORKS.keys()))
-        ),
-    )
-    parser.add_argument(
-        "--rpc-url",
-        dest="rpc_url",
-        default=None,
-        help=(
-            "可选：覆盖默认的 RPC URL。若不提供且未设置对应环境变量，"
-            "脚本会自动尝试该网络的一小组公共 RPC 节点。"
-        ),
     )
     parser.add_argument(
         "--json",
         action="store_true",
-        help="以 JSON 格式输出详细结果（方便脚本继续处理）。",
+        help="以 JSON 格式输出完整结果（适合脚本继续处理）。",
     )
+    return parser.parse_args()
 
-    args = parser.parse_args(argv)
 
-    address = args.address or os.getenv("FUNDER_ADDRESS") or os.getenv("USER_ADDRESS")
-    if not address:
-        parser.error(
-            "未提供钱包地址。请在命令行参数中传入 address，"
-            "或在 .env 中设置 FUNDER_ADDRESS / USER_ADDRESS。"
-        )
+def main() -> int:
+    """CLI 入口函数。"""
+
+    # 尝试加载 .env 中的配置（若存在则自动注入到环境变量）。
+    load_dotenv()
+
+    args = parse_args()
 
     try:
-        result = get_usdc_balance(
-            address=address,
-            network=args.network,
-            rpc_url=args.rpc_url,
-        )
-    except InvalidAddressError as exc:
-        print(f"Invalid address: {exc}")
+        cfg = _load_client_config()
+    except ValueError as exc:
+        # 关键环境变量缺失或非法时给出清晰错误并退出。
+        print(f"配置错误：{exc}")
         return 1
-    except RPCConfigError as exc:
-        print(f"RPC 配置错误: {exc}")
+
+    try:
+        client = _init_clob_client(cfg)
+    except Exception as exc:  # pragma: no cover - 实际依赖外部服务
+        print(f"初始化 ClobClient 失败：{exc}")
         return 1
-    except RuntimeError as exc:
-        print(f"运行时错误: {exc}")
+
+    try:
+        result = _query_collateral_balance_allowance(client)
+    except Exception as exc:  # pragma: no cover - 实际调用依赖网络/API
+        print(f"查询余额与授权失败：{exc}")
         return 1
-    except Exception as exc:  # pragma: no cover - 防御性兜底
-        print(f"未知错误: {exc}")
-        return 1
+
+    # 将 funder 地址一并放入结果，便于脚本消费。
+    result_with_funder: Dict[str, Any] = {
+        **result,
+        "funder": cfg.funder_address,
+    }
 
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        # 以 JSON 形式输出，方便其他脚本解析。
+        print(json.dumps(result_with_funder, ensure_ascii=False))
         return 0
 
-    # Human-readable output
-    symbol = result.get("symbol", "USDC")
-    print(f"网络: {result['network']} (chain_id={result['chain_id']})")
-    print(f"地址: {result['address']}")
-    print(f"USDC 合约: {result['usdc_contract']}")
-    print(f"代币符号: {symbol}")
-    print(f"原始余额 (raw): {result['raw_balance']}")
-    print(
-        "折算余额: "
-        f"{result['balance']:.6f} {symbol} (decimals={result['decimals']})"
-    )
+    # 默认人类可读输出。
+    print("Polymarket 账户余额（CLOB 视角 / L2）")
+    print("--------------------------------")
+    print(f"资金地址 (funder): {result_with_funder['funder']}")
+    print(f"资产类型 (asset_type): {result_with_funder['asset_type']}")
+    print(f"余额 (balance): {result_with_funder['balance']}")
+    print(f"授权额度 (allowance): {result_with_funder['allowance']}")
 
     return 0
 
 
 if __name__ == "__main__":  # CLI 入口
-    import sys
-
     raise SystemExit(main())
 
