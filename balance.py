@@ -2,7 +2,10 @@
 
 The script is primarily geared towards Polymarket's main network (Polygon),
 using the canonical USDC.e collateral token. Optionally, it can also query
-USDC on Base and Arbitrum if appropriate RPC endpoints are provided.
+USDC on Base and Arbitrum.
+
+在未显式提供 RPC URL 且未设置对应环境变量时，脚本会为所选网络依次尝试一小组
+内置的公共 RPC 端点，选取第一个可连通的节点作为数据来源。
 
 Usage examples
 --------------
@@ -79,6 +82,27 @@ NETWORKS: Dict[str, NetworkConfig] = {
 }
 
 
+PUBLIC_RPC_ENDPOINTS: Dict[str, Sequence[str]] = {
+    # A small, conservative list of public mainnet endpoints for each network.
+    "polygon": (
+        "https://polygon-rpc.com",
+        "https://polygon.llamarpc.com",
+        "https://rpc.ankr.com/polygon",
+        "https://1rpc.io/polygon",
+    ),
+    "base": (
+        "https://mainnet.base.org",
+        "https://base.llamarpc.com",
+        "https://rpc.ankr.com/base",
+    ),
+    "arbitrum": (
+        "https://arb1.arbitrum.io/rpc",
+        "https://arbitrum.llamarpc.com",
+        "https://rpc.ankr.com/arbitrum",
+    ),
+}
+
+
 def _get_network_config(name: Optional[str]) -> NetworkConfig:
     """Return :class:`NetworkConfig` for the given network name.
 
@@ -97,13 +121,27 @@ def _get_network_config(name: Optional[str]) -> NetworkConfig:
     return cfg
 
 
-def _resolve_rpc_url(cfg: NetworkConfig, explicit_rpc_url: Optional[str]) -> str:
+def _get_public_rpc_candidates(cfg: NetworkConfig) -> Sequence[str]:
+    """Return a small list of built-in public RPC URLs for ``cfg``'s network.
+
+    These are used as a safe fallback when neither an explicit ``--rpc-url``
+    nor the corresponding environment variable is provided. Especially useful
+    in builder 模式等无法预先配置环境变量的运行环境。
+    """
+
+    return PUBLIC_RPC_ENDPOINTS.get(cfg.name, ())
+
+
+def _resolve_rpc_url(cfg: NetworkConfig, explicit_rpc_url: Optional[str]) -> Optional[str]:
     """Resolve the RPC URL from CLI argument or environment.
 
     Priority:
 
     1. ``explicit_rpc_url`` if provided and non-empty
     2. Environment variable specified by ``cfg.rpc_env_var``
+
+    If both sources are absent, returns ``None`` so that the caller can fall
+    back to built-in public RPC endpoints.
     """
 
     if explicit_rpc_url:
@@ -112,13 +150,11 @@ def _resolve_rpc_url(cfg: NetworkConfig, explicit_rpc_url: Optional[str]) -> str
             return url
 
     env_url = os.getenv(cfg.rpc_env_var, "").strip()
-    if not env_url:
-        raise RPCConfigError(
-            f"未配置 {cfg.name} RPC URL。"
-            f"请通过环境变量 {cfg.rpc_env_var} 或命令行参数 --rpc-url 提供。"
-        )
+    if env_url:
+        return env_url
 
-    return env_url
+    # No explicit or env RPC URL configured; let caller decide how to fall back.
+    return None
 
 
 def get_usdc_balance(
@@ -138,9 +174,11 @@ def get_usdc_balance(
         Logical network name. Defaults to ``"polygon"``. Supported values
         currently are ``"polygon"``, ``"base"`` and ``"arbitrum"``.
     rpc_url:
-        Optional RPC URL. When omitted, the function falls back to the
+        Optional RPC URL. When omitted, the function first checks the
         environment variable associated with the selected network (for
-        example ``POLYGON_RPC_URL``).
+        example ``POLYGON_RPC_URL``). If that is also missing, it falls back
+        to a small built-in list of public RPC endpoints and uses the first
+        one that is reachable.
 
     Returns
     -------
@@ -172,11 +210,44 @@ def get_usdc_balance(
             "web3 未安装，无法查询链上余额。请先安装 web3，例如: pip install web3"
         ) from exc
 
-    w3 = Web3(Web3.HTTPProvider(resolved_rpc_url))
-    if not w3.is_connected():  # pragma: no cover - 网络相关
-        raise RPCConfigError(
-            f"无法连接到 {cfg.name} RPC 节点，请检查 {cfg.rpc_env_var} 或 --rpc-url 配置。"
-        )
+    w3 = None
+
+    # 1) 显式或环境变量提供的 RPC URL
+    if resolved_rpc_url:
+        w3 = Web3(Web3.HTTPProvider(resolved_rpc_url))
+        if not w3.is_connected():  # pragma: no cover - 网络相关
+            raise RPCConfigError(
+                f"无法连接到 {cfg.name} RPC 节点，请检查 {cfg.rpc_env_var} 或 --rpc-url 配置。"
+            )
+
+    # 2) 无任何显式/环境配置时，尝试内置的公共 RPC 列表
+    if w3 is None:
+        candidates = list(_get_public_rpc_candidates(cfg))
+        if not candidates:
+            raise RPCConfigError(
+                f"未配置 {cfg.name} RPC URL，且当前脚本未内置公共 RPC 列表。"
+                f"请通过环境变量 {cfg.rpc_env_var} 或命令行参数 --rpc-url 提供。"
+            )
+
+        last_error: Optional[Exception] = None
+        for url in candidates:
+            candidate_w3 = Web3(Web3.HTTPProvider(url))
+            try:
+                if candidate_w3.is_connected():  # pragma: no cover - 网络相关
+                    w3 = candidate_w3
+                    resolved_rpc_url = url
+                    break
+            except Exception as exc:  # pragma: no cover - 网络相关
+                last_error = exc
+
+        if w3 is None:
+            urls = ", ".join(candidates)
+            extra = f" 最后一次连接错误: {last_error}" if last_error else ""
+            raise RPCConfigError(
+                f"无法连接到任何 {cfg.name} 公共 RPC 节点。尝试的 URL: {urls}。"  # noqa: E501
+                f"请检查本地网络，或通过环境变量 {cfg.rpc_env_var} 或 --rpc-url 指定可用的 RPC。"  # noqa: E501
+                + extra
+            )
 
     # Minimal ERC20 ABI: balanceOf, decimals, symbol
     erc20_abi = [
@@ -264,6 +335,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "查询指定地址在指定网络上的 USDC ERC20 余额（默认 Polygon / USDC.e）。"
+            "在未显式提供 --rpc-url 且未设置对应环境变量时，会自动尝试一小组公共 RPC 节点。"
         )
     )
     parser.add_argument(
@@ -289,7 +361,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dest="rpc_url",
         default=None,
         help=(
-            "可选：覆盖默认的 RPC URL（否则从对应的环境变量读取，例如 POLYGON_RPC_URL / BASE_RPC_URL / ARBITRUM_RPC_URL）。"
+            "可选：覆盖默认的 RPC URL。若不提供且未设置对应环境变量，"
+            "脚本会自动尝试该网络的一小组公共 RPC 节点。"
         ),
     )
     parser.add_argument(
