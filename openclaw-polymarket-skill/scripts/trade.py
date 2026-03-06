@@ -52,6 +52,13 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="要交易的 token_id（字符串，必填，不能为空）",
     )
+    parser.add_argument(
+        "--side",
+        type=str,
+        default="BUY",
+        choices=["BUY", "SELL"],
+        help="交易方向：BUY（买入）或 SELL（卖出），默认BUY",
+    )
 
     args = parser.parse_args()
 
@@ -110,30 +117,20 @@ def main() -> None:
 
     print("ClobClient 初始化成功 (Builder 模式)！")
 
-    # --- 5. 下单演示 ---
-    market_condition_id = "0xaf9d0e448129a9f657f851d49495ba4742055d80e0ef1166ba0ee81d4d594214"  # 替换为目标市场的 condition_id
-    no_token_id = args.token_id  # 从命令行参数传入的 token_id
-
-    # 获取 tickSize 和 negRisk
-    market_details = client.get_market(market_condition_id)
-    print(market_details)
-    tick_size = str(market_details["minimum_tick_size"])  # e.g., "0.01"
-    neg_risk = market_details["neg_risk"]  # e.g., False
-
-    # 下一个卖单 (Sell No, 相当于看好 Yes)
+    # --- 5. 下单 ---
     try:
-        sell_order_response = client.create_and_post_order(
+        side = BUY if args.side == "BUY" else SELL
+        order_response = client.create_and_post_order(
             OrderArgs(
-                token_id=no_token_id,
+                token_id=args.token_id,
                 price=args.price,  # 价格
                 size=args.shares,  # 数量 (shares)
-                side=BUY,
+                side=side,
             )
-            # options={"tick_size": tick_size, "neg_risk": neg_risk}
         )
-        print(f"卖单提交成功: {sell_order_response}")
+        print(f"{args.side}单提交成功: {order_response}")
     except Exception as e:
-        print(f"卖单提交失败: {e}")
+        print(f"{args.side}单提交失败: {e}")
 
 
 if __name__ == "__main__":
